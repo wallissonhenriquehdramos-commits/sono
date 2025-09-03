@@ -27,7 +27,6 @@ if "results" not in st.session_state:
     st.session_state.results = None
 if "mode_snapshot" not in st.session_state:
     st.session_state.mode_snapshot = None
-# estado dos uploaders
 if "psg_files" not in st.session_state:
     st.session_state.psg_files = []
 if "hyp_files" not in st.session_state:
@@ -49,6 +48,27 @@ STAGE_MAP = {
 }
 
 # ==============================
+# HELPER para UploadedFile → caminho em disco
+# ==============================
+def _materialize_upload(uploaded_file, suffix=None):
+    """
+    Recebe um UploadedFile do Streamlit e grava em arquivo temporário.
+    Retorna o caminho (string) para bibliotecas que exigem path.
+    """
+    if uploaded_file is None:
+        return None
+    # Se já for um path/bytes/PathLike, apenas converte para str
+    if isinstance(uploaded_file, (str, bytes, os.PathLike)):
+        return str(uploaded_file)
+    # Extensão (mantém a original se possível)
+    ext = suffix or os.path.splitext(getattr(uploaded_file, "name", ""))[1] or ""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+    tmp.write(uploaded_file.getbuffer())
+    tmp.flush()
+    tmp.close()
+    return tmp.name
+
+# ==============================
 # FUNÇÕES DE SINAL
 # ==============================
 def bandpower(x, sf, fmin, fmax):
@@ -56,13 +76,11 @@ def bandpower(x, sf, fmin, fmax):
     idx = (freqs >= fmin) & (freqs < fmax)
     return float(np.trapz(psd[idx], freqs[idx])) if np.any(idx) else 0.0
 
-
 def pick_channels(chs):
     eeg = [c for c in ["EEG Fpz-Cz", "Fpz-Cz", "EEG Pz-Oz", "Pz-Oz"] if c in chs][:2]
     eog = [c for c in ["EOG horizontal", "EOG", "EOG L", "EOG R"] if c in chs][:1]
     emg = [c for c in ["EMG submental", "EMG"] if c in chs][:1]
     return eeg, eog, emg
-
 
 def epoch_labels_from_annotations(raw, epoch_len=30.0):
     ann = raw.annotations
@@ -79,7 +97,6 @@ def epoch_labels_from_annotations(raw, epoch_len=30.0):
         labels.append(STAGE_MAP.get(desc, None))
     return np.array(labels, dtype=object)
 
-
 def detect_spindles_K_simple(raw, epoch_len=30.0):
     """Heurística simples: 'densidade' de fusos (12–16 Hz) e complexos K (0.7–2 Hz) por época."""
     sf = raw.info["sfreq"]
@@ -90,7 +107,6 @@ def detect_spindles_K_simple(raw, epoch_len=30.0):
     x = raw.get_data(picks=[ch])[0]
 
     from scipy.signal import butter, filtfilt
-
     def bp(sig, lo, hi):
         b, a = butter(4, [lo / (sf / 2), hi / (sf / 2)], btype="band")
         return filtfilt(b, a, sig)
@@ -106,12 +122,10 @@ def detect_spindles_K_simple(raw, epoch_len=30.0):
     n_epochs = int(raw.times[-1] // epoch_len)
     sp_density, k_density = [], []
     for i in range(n_epochs):
-        t0 = int(i * epoch_len * sf)
-        t1 = int((i + 1) * epoch_len * sf)
+        t0 = int(i * epoch_len * sf); t1 = int((i + 1) * epoch_len * sf)
         sp_density.append(float(spindle_mask[t0:t1].mean()))
         k_density.append(float(k_mask[t0:t1].mean()))
     return np.array(sp_density), np.array(k_density)
-
 
 def extract_features_from_raw(raw, epoch_len=30.0, resample_hz=100):
     raw.filter(0.5, 40.0, fir_design="firwin", verbose=False)
@@ -136,25 +150,20 @@ def extract_features_from_raw(raw, epoch_len=30.0, resample_hz=100):
     n_epochs = len(labels)
 
     for i in range(n_epochs):
-        t0 = i * epoch_len
-        t1 = t0 + epoch_len
+        t0 = i * epoch_len; t1 = t0 + epoch_len
         try:
             seg = raw.copy().crop(t0, t1).get_data()
         except Exception:
             break
         row = []
         for ch in eeg_chs:
-            idx = raw.ch_names.index(ch)
-            x = seg[idx]
+            idx = raw.ch_names.index(ch); x = seg[idx]
             for (lo, hi) in BANDS.values():
                 row.append(bandpower(x, sf, lo, hi))
         if eog_chs:
-            idx = raw.ch_names.index(eog_chs[0])
-            row.append(float(np.var(seg[idx])))
+            idx = raw.ch_names.index(eog_chs[0]); row.append(float(np.var(seg[idx])))
         if emg_chs:
-            idx = raw.ch_names.index(emg_chs[0])
-            x = seg[idx]
-            row.append(float(np.sqrt(np.mean(x ** 2))))
+            idx = raw.ch_names.index(emg_chs[0]); x = seg[idx]; row.append(float(np.sqrt(np.mean(x ** 2))))
         row.append(float(sp_dens[i]) if sp_dens is not None else 0.0)
         row.append(float(k_dens[i]) if k_dens is not None else 0.0)
         X_rows.append(row)
@@ -164,7 +173,6 @@ def extract_features_from_raw(raw, epoch_len=30.0, resample_hz=100):
     mask = y != None
     return X[mask], y[mask], feat_names
 
-
 # ==============================
 # IA / AVALIAÇÃO
 # ==============================
@@ -173,7 +181,6 @@ def group_labels(y, group=False):
         return y, CLASSES5
     y2 = np.where(np.isin(y, ["N1", "N2"]), "SonoLeve", y)
     return y2, CLASSES4
-
 
 def compute_sleep_stats(y_seq, epoch_len=30.0, classes=None):
     if classes is None:
@@ -198,7 +205,6 @@ def compute_sleep_stats(y_seq, epoch_len=30.0, classes=None):
         "percent_by_stage": perc,
     }
 
-
 def plot_hypnogram(y_true, y_pred, classes, fname="hypnogram.png", title="Hipnograma (Real x Previsto)"):
     mapping = {c: i for i, c in enumerate(classes)}
     t = np.arange(len(y_true))
@@ -206,14 +212,9 @@ def plot_hypnogram(y_true, y_pred, classes, fname="hypnogram.png", title="Hipnog
     plt.plot(t, [mapping[c] for c in y_true], drawstyle="steps-mid", label="Real")
     plt.plot(t, [mapping[c] for c in y_pred], drawstyle="steps-mid", alpha=0.6, label="Previsto")
     plt.yticks(range(len(classes)), classes)
-    plt.xlabel("Épocas (30s)")
-    plt.title(title)
-    plt.legend(loc="upper right")
-    plt.tight_layout()
-    plt.savefig(fname, dpi=150)
-    plt.close()
+    plt.xlabel("Épocas (30s)"); plt.title(title); plt.legend(loc="upper right")
+    plt.tight_layout(); plt.savefig(fname, dpi=150); plt.close()
     return fname
-
 
 def export_pdf(rep_dict, cm, classes, imp_fig_path, hyp_fig_path, stats_dict, outpath="report.pdf"):
     doc = SimpleDocTemplate(outpath)
@@ -226,7 +227,7 @@ def export_pdf(rep_dict, cm, classes, imp_fig_path, hyp_fig_path, stats_dict, ou
         f"Tempo na cama (TIB): {s['tib_min']:.1f} min",
         f"Tempo total de sono (TST): {s['tst_min']:.1f} min",
         f"Eficiência do sono: {s['efficiency']:.1f}%",
-        f"Latência do sono: {s['latency_min']:.1f} min" if s["latency_min"] is not None else "Latência do sono: n/d",
+        f"Latência do sono: {s['latency_min']:.1f} min" if s['latency_min'] is not None else "Latência do sono: n/d",
         "Distribuição por estágio: " + ", ".join([f"{k}={v:.1f}%" for k, v in s["percent_by_stage"].items()]),
     ]
     elems.append(Paragraph("<br/>".join(lines_stats), styles["Normal"]))
@@ -236,23 +237,19 @@ def export_pdf(rep_dict, cm, classes, imp_fig_path, hyp_fig_path, stats_dict, ou
     for k, v in rep_dict.items():
         if isinstance(v, dict):
             lines.append(
-                f"[{k}] precision={v.get('precision',0):.3f}  recall={v.get('recall',0):.3f} "
-                f" f1={v.get('f1-score',0):.3f}  support={v.get('support',0)}"
+                f"[{k}] precision={v.get('precision',0):.3f}  recall={v.get('recall',0):.3f}  "
+                f"f1={v.get('f1-score',0):.3f}  support={v.get('support',0)}"
             )
     elems.append(Paragraph("<br/>".join(lines), styles["Code"]))
     elems.append(Spacer(1, 12))
 
     plt.figure(figsize=(5, 4))
-    plt.imshow(cm)
-    plt.title("Confusion Matrix")
-    plt.xticks(range(len(classes)), classes)
-    plt.yticks(range(len(classes)), classes)
+    plt.imshow(cm); plt.title("Confusion Matrix")
+    plt.xticks(range(len(classes)), classes); plt.yticks(range(len(classes)), classes)
     for i in range(len(classes)):
         for j in range(len(classes)):
             plt.text(j, i, cm[i, j], ha="center", va="center", color="red", fontsize=8)
-    plt.tight_layout()
-    plt.savefig("cm.png", dpi=150)
-    plt.close()
+    plt.tight_layout(); plt.savefig("cm.png", dpi=150); plt.close()
     elems.append(RLImage("cm.png", width=380, height=300))
     elems.append(Spacer(1, 12))
 
@@ -266,47 +263,36 @@ def export_pdf(rep_dict, cm, classes, imp_fig_path, hyp_fig_path, stats_dict, ou
     with open(outpath, "rb") as f:
         return f.read()
 
-
 def train_holdout(X, y, classes):
     Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
-    scaler = StandardScaler()
-    Xtr_s = scaler.fit_transform(Xtr)
-    Xte_s = scaler.transform(Xte)
+    scaler = StandardScaler(); Xtr_s = scaler.fit_transform(Xtr); Xte_s = scaler.transform(Xte)
     rf = RandomForestClassifier(n_estimators=300, random_state=42)
-    rf.fit(Xtr_s, ytr)
-    pred = rf.predict(Xte_s)
+    rf.fit(Xtr_s, ytr); pred = rf.predict(Xte_s)
     rep = classification_report(yte, pred, labels=classes, zero_division=0, output_dict=True)
-    cm = confusion_matrix(yte, pred, labels=classes)
+    cm  = confusion_matrix(yte, pred, labels=classes)
     importances = rf.feature_importances_
     return rf, scaler, rep, cm, importances, (yte, pred), (X, y)
-
 
 def train_loso(subj_data, classes):
     all_reports, cms, importances_all, folds_info = [], [], [], []
     for i in range(len(subj_data)):
-        X_te = subj_data[i]["X"]
-        y_te = subj_data[i]["y"]
-        X_tr = np.vstack([d["X"] for j, d in enumerate(subj_data) if j != i])
-        y_tr = np.concatenate([d["y"] for j, d in enumerate(subj_data) if j != i])
+        X_te = subj_data[i]['X']; y_te = subj_data[i]['y']
+        X_tr = np.vstack([d['X'] for j, d in enumerate(subj_data) if j != i])
+        y_tr = np.concatenate([d['y'] for j, d in enumerate(subj_data) if j != i])
 
-        scaler = StandardScaler()
-        Xtr_s = scaler.fit_transform(X_tr)
-        Xte_s = scaler.transform(X_te)
+        scaler = StandardScaler(); Xtr_s = scaler.fit_transform(X_tr); Xte_s = scaler.transform(X_te)
         rf = RandomForestClassifier(n_estimators=300, random_state=42)
-        rf.fit(Xtr_s, y_tr)
-        pred = rf.predict(Xte_s)
+        rf.fit(Xtr_s, y_tr); pred = rf.predict(Xte_s)
 
         rep = classification_report(y_te, pred, labels=classes, zero_division=0, output_dict=True)
-        cm = confusion_matrix(y_te, pred, labels=classes)
+        cm  = confusion_matrix(y_te, pred, labels=classes)
 
-        all_reports.append(rep)
-        cms.append(cm)
+        all_reports.append(rep); cms.append(cm)
         importances_all.append(rf.feature_importances_)
         folds_info.append({"y_true": y_te, "y_pred": pred})
 
     mean_cm = np.mean(np.stack(cms), axis=0).round(1)
     mean_imp = np.mean(np.stack(importances_all), axis=0)
-
     keys = list(all_reports[0].keys())
     mean_report = {}
     for k in keys:
@@ -314,44 +300,44 @@ def train_loso(subj_data, classes):
             mean_report[k] = {m: float(np.mean([r[k][m] for r in all_reports])) for m in all_reports[0][k].keys()}
         else:
             mean_report[k] = float(np.mean([r[k] for r in all_reports]))
-
     last_fold = folds_info[-1]
     return mean_report, mean_cm, mean_imp, last_fold
 
+# ==============================
+# SIDEBAR — MODO FORA DO FORM + FORM (resto) + UPLOADERS
+# ==============================
+st.sidebar.header("⚙️ Configurações")
 
-# ==============================
-# SIDEBAR — FORM (config) + uploaders FORA do form
-# ==============================
+# 1) Modo FORA do form (atualiza a UI ao trocar)
+mode = st.sidebar.radio("Modo de dados:", ["Sleep-EDF (baixar)", "Arquivos locais (upload)"], key="mode_selector")
+
+# 2) Uploaders aparecem imediatamente quando modo = upload
+if mode == "Arquivos locais (upload)":
+    st.sidebar.markdown("### 📁 Upload de arquivos")
+    st.sidebar.caption("Envie PSG(s) (.edf) e hipnogramas (.edf/.xml) na mesma quantidade e ordem.")
+    st.session_state.psg_files = st.sidebar.file_uploader(
+        "PSG (EDF) — 1 ou mais", type=["edf"], accept_multiple_files=True, key="psg_files_key"
+    )
+    st.session_state.hyp_files = st.sidebar.file_uploader(
+        "Hipnogramas (EDF/XML) — MESMA quantidade (opcional)", type=["edf", "xml"], accept_multiple_files=True, key="hyp_files_key"
+    )
+
+# 3) Demais configurações dentro do form
 with st.sidebar.form("config"):
-    st.header("⚙️ Configurações")
-    mode = st.radio("Modo de dados:", ["Sleep-EDF (baixar)", "Arquivos locais (upload)"])
     group = st.checkbox("Agrupar N1+N2 como Sono Leve", value=True)
     epoch_len = st.number_input("Duração da época (s)", 10.0, 60.0, 30.0, 5.0)
     resample_hz = st.number_input("Reamostragem (Hz)", 50.0, 200.0, 100.0, 10.0)
     val_mode = st.radio("Modo de validação:", ["Holdout (75/25)", "LOSO (por sujeito)"], index=0)
 
+    # Campos específicos do Sleep-EDF
     if mode == "Sleep-EDF (baixar)":
         subjects_text = st.text_input("IDs de sujeitos (ex.: 0 1)", "0")
         recording = st.number_input("Recording (geralmente 1)", 1, 2, 1, 1)
     else:
-        st.markdown("**Envie os arquivos logo abaixo (fora do formulário).**\n"
-                    "Pareamento por ORDEM: 1º PSG ↔ 1º Hipnograma, 2º PSG ↔ 2º Hipnograma…")
         subjects_text = None
         recording = None
 
     start_btn = st.form_submit_button("🚀 Processar & Treinar")
-
-# Uploaders FORA do form (para aparecerem e funcionarem corretamente)
-if mode == "Arquivos locais (upload)":
-    st.sidebar.markdown("### 📁 Upload de arquivos")
-    st.sidebar.caption("PSG(s) em .edf e, opcionalmente, hipnogramas (.edf/.xml) na mesma quantidade.")
-    st.session_state.psg_files = st.sidebar.file_uploader(
-        "PSG (EDF) — 1 ou mais", type=["edf"], accept_multiple_files=True, key="psg_files_key"
-    )
-    st.session_state.hyp_files = st.sidebar.file_uploader(
-        "Hipnograma (EDF/XML) — MESMA quantidade (opcional)",
-        type=["edf", "xml"], accept_multiple_files=True, key="hyp_files_key"
-    )
 
 status = st.empty()
 
@@ -382,7 +368,6 @@ if start_btn:
                 subj_data.append({"X": X_, "y": y_})
 
         else:
-            # ---- ARQUIVOS LOCAIS (UPLOAD) ----
             psg_files = st.session_state.psg_files
             hyp_files = st.session_state.hyp_files
 
@@ -390,18 +375,17 @@ if start_btn:
                 st.error("Envie pelo menos 1 arquivo de PSG (.edf).")
                 st.stop()
 
-            # Somente features (sem hipnograma)
+            # Sem hipnograma: apenas extrai features
             if not hyp_files or len(hyp_files) == 0:
                 st.warning("Nenhum hipnograma enviado. Vou extrair features SEM rótulos (não dá para treinar/avaliar).")
-                all_feats = []
-                fnames = None
-                for psg_up in sorted(psg_files, key=lambda f: f.name):
-                    raw = read_raw_edf(psg_up, preload=True, verbose=False)
+                all_feats = []; fnames = None
+                for psg_up in sorted(psg_files, key=lambda f: getattr(f, "name", str(f))):
+                    psg_path = _materialize_upload(psg_up, suffix=".edf")
+                    raw = read_raw_edf(psg_path, preload=True, verbose=False)
                     X_, y_, fn = extract_features_from_raw(raw, epoch_len=epoch_len, resample_hz=resample_hz)
                     if fnames is None:
                         fnames = fn
-                    df = pd.DataFrame(X_, columns=fnames)
-                    all_feats.append(df)
+                    all_feats.append(pd.DataFrame(X_, columns=fnames))
                 if all_feats:
                     df_all = pd.concat(all_feats, ignore_index=True)
                     st.success(f"Features extraídas de {len(all_feats)} arquivo(s).")
@@ -413,32 +397,26 @@ if start_btn:
                     )
                 st.stop()
 
-            # Pares PSG + Hipnograma (quantidade igual)
             if len(psg_files) != len(hyp_files):
                 st.error("O número de PSGs e hipnogramas deve ser o mesmo.")
                 st.stop()
 
-            psg_sorted = sorted(psg_files, key=lambda f: f.name)
-            hyp_sorted = sorted(hyp_files, key=lambda f: f.name)
+            psg_sorted = sorted(psg_files, key=lambda f: getattr(f, "name", str(f)))
+            hyp_sorted = sorted(hyp_files, key=lambda f: getattr(f, "name", str(f)))
 
             for psg_up, hyp_up in zip(psg_sorted, hyp_sorted):
-                try:
-                    raw = read_raw_edf(psg_up, preload=True, verbose=False)
-                except Exception as e:
-                    st.error(f"Falha ao ler PSG {psg_up.name}: {e}")
-                    st.stop()
-                try:
-                    ann = mne.read_annotations(hyp_up)
-                except Exception as e1:
-                    st.error(f"Falha ao ler hipnograma {hyp_up.name}: {e1}")
-                    st.stop()
+                psg_path = _materialize_upload(psg_up, suffix=".edf")
+                hyp_path = _materialize_upload(hyp_up)  # mantém extensão (.edf ou .xml)
 
+                raw = read_raw_edf(psg_path, preload=True, verbose=False)
+                ann = mne.read_annotations(hyp_path)
                 raw.set_annotations(ann, emit_warning=False)
+
                 X_, y_, fn = extract_features_from_raw(raw, epoch_len=epoch_len, resample_hz=resample_hz)
                 y_, classes_used = group_labels(y_, group=group)
 
                 if len(y_) == 0 or all(lab is None for lab in y_):
-                    st.error(f"{psg_up.name}: não há rótulos válidos após ler o hipnograma.")
+                    st.error(f"{getattr(psg_up, 'name', 'PSG')}: não há rótulos válidos após ler o hipnograma.")
                     st.stop()
 
                 if fnames is None:
@@ -447,62 +425,47 @@ if start_btn:
 
         # ---- HOLDOUT ----
         if val_mode.startswith("Holdout"):
-            X = np.vstack([d["X"] for d in subj_data])
-            y = np.concatenate([d["y"] for d in subj_data])
+            X = np.vstack([d["X"] for d in subj_data]); y = np.concatenate([d["y"] for d in subj_data])
             status.success(f"Dados prontos: {X.shape[0]} épocas, {X.shape[1]} features. Treinando (Holdout)…")
             rf, scaler, rep, cm, importances, (yte, pred), (X_all, y_all) = train_holdout(X, y, classes_used)
 
-            # Relatório
             rep_df = pd.DataFrame(rep).T.round(3)
             st.subheader("📈 Relatório de Classificação (Holdout)")
             st.dataframe(rep_df)
 
-            # Matriz de confusão
             st.subheader("🧩 Matriz de Confusão")
             fig_cm, ax = plt.subplots()
             ax.imshow(cm)
-            ax.set_xticks(range(len(classes_used)))
-            ax.set_xticklabels(classes_used)
-            ax.set_yticks(range(len(classes_used)))
-            ax.set_yticklabels(classes_used)
+            ax.set_xticks(range(len(classes_used))); ax.set_xticklabels(classes_used)
+            ax.set_yticks(range(len(classes_used))); ax.set_yticklabels(classes_used)
             ax.set_title("Confusion Matrix")
             for i in range(len(classes_used)):
                 for j in range(len(classes_used)):
                     ax.text(j, i, cm[i, j], ha="center", va="center", color="red", fontsize=8)
             st.pyplot(fig_cm)
 
-            # Importância
             st.subheader("🔍 Importância das Features")
-            order = np.argsort(importances)[::-1]
-            topk = min(25, len(importances))
+            order = np.argsort(importances)[::-1]; topk = min(25, len(importances))
             fig_imp, ax2 = plt.subplots(figsize=(8, 6))
             ax2.barh(range(topk), importances[order[:topk]][::-1])
             ax2.set_yticks(range(topk))
             ax2.set_yticklabels([fnames[i] for i in order[:topk]][::-1], fontsize=8)
-            ax2.set_xlabel("Gini importance")
-            ax2.set_title("Top features")
+            ax2.set_xlabel("Gini importance"); ax2.set_title("Top features")
             st.pyplot(fig_imp)
 
-            # Hipnograma + stats
             hyp_path = plot_hypnogram(yte, pred, classes_used, fname="hyp_holdout.png", title="Hipnograma (Holdout — teste)")
             stats = compute_sleep_stats(yte, epoch_len=epoch_len, classes=classes_used)
 
-            # PDF
             fig_imp.savefig("feature_importance.png", dpi=150)
             pdf_bytes = export_pdf(rep, cm, classes_used, "feature_importance.png", hyp_path, stats, outpath="report.pdf")
 
-            # features.csv (todos)
-            df_feats = pd.DataFrame(X_all, columns=fnames)
-            df_feats["stage"] = y_all
+            df_feats = pd.DataFrame(X_all, columns=fnames); df_feats["stage"] = y_all
             features_csv_bytes = df_feats.to_csv(index=False).encode("utf-8")
 
-            # Modelo .joblib
             buf_model = io.BytesIO()
             joblib.dump({"model": rf, "scaler": scaler, "classes": classes_used, "features": fnames}, buf_model)
-            buf_model.seek(0)
-            model_bytes = buf_model.read()
+            buf_model.seek(0); model_bytes = buf_model.read()
 
-            # Persistência
             st.session_state.results = {
                 "val_mode": "holdout",
                 "rep_df": rep_df,
@@ -533,10 +496,8 @@ if start_btn:
             st.subheader("🧩 Matriz de Confusão (média LOSO)")
             fig_cm, ax = plt.subplots()
             ax.imshow(mean_cm)
-            ax.set_xticks(range(len(classes_used)))
-            ax.set_xticklabels(classes_used)
-            ax.set_yticks(range(len(classes_used)))
-            ax.set_yticklabels(classes_used)
+            ax.set_xticks(range(len(classes_used))); ax.set_xticklabels(classes_used)
+            ax.set_yticks(range(len(classes_used))); ax.set_yticklabels(classes_used)
             ax.set_title("Confusion Matrix — média (validação por sujeito)")
             for i in range(len(classes_used)):
                 for j in range(len(classes_used)):
@@ -544,30 +505,25 @@ if start_btn:
             st.pyplot(fig_cm)
 
             st.subheader("🔍 Importância das Features (média LOSO)")
-            order = np.argsort(mean_imp)[::-1]
-            topk = min(25, len(mean_imp))
+            order = np.argsort(mean_imp)[::-1]; topk = min(25, len(mean_imp))
             fig_imp, ax2 = plt.subplots(figsize=(8, 6))
             ax2.barh(range(topk), mean_imp[order[:topk]][::-1])
             ax2.set_yticks(range(topk))
-            # ✅ correção do bug:
             ax2.set_yticklabels([fnames[i] for i in order[:topk]][::-1], fontsize=8)
-            ax2.set_xlabel("Gini importance")
-            ax2.set_title("Top features (média LOSO)")
+            ax2.set_xlabel("Gini importance"); ax2.set_title("Top features (média LOSO)")
             st.pyplot(fig_imp)
 
             hyp_path = plot_hypnogram(
-                last_fold["y_true"], last_fold["y_pred"], classes_used, fname="hyp_loso.png", title="Hipnograma (sujeito de teste — LOSO)"
+                last_fold["y_true"], last_fold["y_pred"], classes_used,
+                fname="hyp_loso.png", title="Hipnograma (sujeito de teste — LOSO)"
             )
             stats = compute_sleep_stats(last_fold["y_true"], epoch_len=epoch_len, classes=classes_used)
 
             fig_imp.savefig("feature_importance.png", dpi=150)
             pdf_bytes = export_pdf(mean_report, mean_cm, classes_used, "feature_importance.png", hyp_path, stats, outpath="report.pdf")
 
-            # features.csv (todos)
-            X_all = np.vstack([d["X"] for d in subj_data])
-            y_all = np.concatenate([d["y"] for d in subj_data])
-            df_feats = pd.DataFrame(X_all, columns=fnames)
-            df_feats["stage"] = y_all
+            X_all = np.vstack([d["X"] for d in subj_data]); y_all = np.concatenate([d["y"] for d in subj_data])
+            df_feats = pd.DataFrame(X_all, columns=fnames); df_feats["stage"] = y_all
             features_csv_bytes = df_feats.to_csv(index=False).encode("utf-8")
 
             st.session_state.results = {
@@ -607,10 +563,8 @@ else:
 
     fig_cm, ax = plt.subplots()
     ax.imshow(res["cm"])
-    ax.set_xticks(range(len(res["classes"])))
-    ax.set_xticklabels(res["classes"])
-    ax.set_yticks(range(len(res["classes"])))
-    ax.set_yticklabels(res["classes"])
+    ax.set_xticks(range(len(res["classes"]))); ax.set_xticklabels(res["classes"])
+    ax.set_yticks(range(len(res["classes"]))); ax.set_yticklabels(res["classes"])
     ax.set_title("Confusion Matrix")
     for i in range(len(res["classes"])):
         for j in range(len(res["classes"])):
@@ -625,9 +579,7 @@ else:
     st.download_button("⬇️ Baixar Relatório PDF", data=res["pdf_bytes"], file_name="report.pdf", mime="application/pdf")
     st.download_button("⬇️ Baixar features.csv", data=res["features_csv_bytes"], file_name="features.csv", mime="text/csv")
     if res["model_bytes"] is not None:
-        st.download_button(
-            "💾 Baixar modelo (.joblib)", data=res["model_bytes"], file_name="sono_xai_model.joblib", mime="application/octet-stream"
-        )
+        st.download_button("💾 Baixar modelo (.joblib)", data=res["model_bytes"], file_name="sono_xai_model.joblib", mime="application/octet-stream")
 
     if st.button("🧹 Limpar resultados"):
         st.session_state.results = None
