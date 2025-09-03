@@ -1,4 +1,4 @@
-# app.py — Sono-XAI com Holdout/LOSO, hipnograma, PDF clínico e sessão persistente
+# app.py — Sono-XAI com Holdout/LOSO, upload local robusto, hipnograma, PDF clínico e sessão persistente
 import os, io, joblib, tempfile
 import numpy as np
 import pandas as pd
@@ -286,8 +286,10 @@ with st.sidebar.form("config"):
         subjects_text = st.text_input("IDs de sujeitos (ex.: 0 1)", "0")
         recording = st.number_input("Recording (geralmente 1)", 1, 2, 1, 1)
     else:
-        psg_files = st.file_uploader("Envie PSG (EDF) — 1 ou mais", type=["edf"], accept_multiple_files=True)
-        hyp_files = st.file_uploader("Envie Hipnogramas (EDF/XML) — mesmo número", type=["edf","xml"], accept_multiple_files=True)
+        st.markdown("**Envie os arquivos na MESMA ordem:** 1º PSG ↔ 1º Hipnograma, 2º PSG ↔ 2º Hipnograma…")
+        psg_files = st.file_uploader("📁 PSG (EDF) — 1 ou mais", type=["edf"], accept_multiple_files=True)
+        hyp_files = st.file_uploader("📝 Hipnograma (EDF/XML) — MESMA quantidade (opcional)", type=["edf","xml"], accept_multiple_files=True)
+        st.caption("Se não enviar hipnograma, o app extrai apenas as features (sem treinar).")
 
     start_btn = st.form_submit_button("🚀 Processar & Treinar")
 
@@ -317,19 +319,77 @@ if start_btn:
                 y_, classes_used = group_labels(y_, group=group)
                 if fnames is None: fnames = fn
                 subj_data.append({"X":X_, "y":y_})
+
         else:
-            if not psg_files or not hyp_files:
-                st.error("Envie PSG(s) e hipnograma(s) com a mesma quantidade."); st.stop()
+            # ---- ARQUIVOS LOCAIS (UPLOAD) ----
+            # Regras:
+            # - Se enviar só PSG: extrai features e permite baixar CSV (sem rótulos)
+            # - Se enviar PSG + Hipnograma(s): deve ter a MESMA quantidade; pareamento por ORDEM
+
+            if not psg_files:
+                st.error("Envie pelo menos 1 arquivo de PSG (.edf).")
+                st.stop()
+
+            # Caso o usuário queira somente extrair features (sem hipnograma)
+            if not hyp_files or len(hyp_files) == 0:
+                st.warning("Nenhum hipnograma enviado. Vou extrair features SEM rótulos (não dá para treinar/avaliar).")
+                all_feats = []
+                fnames = None
+                for psg_up in psg_files:
+                    raw = read_raw_edf(psg_up, preload=True, verbose=False)
+                    # sem annotations → y ficará None; serve só para features
+                    X_, y_, fn = extract_features_from_raw(raw, epoch_len=epoch_len, resample_hz=resample_hz)
+                    if fnames is None: fnames = fn
+                    df = pd.DataFrame(X_, columns=fnames)
+                    all_feats.append(df)
+
+                if all_feats:
+                    df_all = pd.concat(all_feats, ignore_index=True)
+                    st.success(f"Features extraídas de {len(all_feats)} arquivo(s).")
+                    st.download_button("⬇️ Baixar features.csv (sem rótulo)",
+                                       data=df_all.to_csv(index=False).encode("utf-8"),
+                                       file_name="features_unlabeled.csv",
+                                       mime="text/csv")
+                st.stop()
+
+            # Se chegou aqui, temos pares PSG + Hipnograma
             if len(psg_files) != len(hyp_files):
-                st.error("O número de PSGs e hipnogramas deve ser o mesmo."); st.stop()
-            for psg_up, hyp_up in zip(psg_files, hyp_files):
-                raw = read_raw_edf(psg_up, preload=True, verbose=False)
-                ann = mne.read_annotations(hyp_up)
+                st.error("O número de PSGs e hipnogramas deve ser o mesmo.")
+                st.stop()
+
+            # Ordena por nome para pareamento previsível (1º com 1º, etc.)
+            psg_sorted = sorted(psg_files, key=lambda f: f.name)
+            hyp_sorted = sorted(hyp_files, key=lambda f: f.name)
+
+            for psg_up, hyp_up in zip(psg_sorted, hyp_sorted):
+                try:
+                    raw = read_raw_edf(psg_up, preload=True, verbose=False)
+                except Exception as e:
+                    st.error(f"Falha ao ler PSG {psg_up.name}: {e}")
+                    st.stop()
+
+                # Lê annotations do hipnograma (.edf ou .xml)
+                try:
+                    ann = mne.read_annotations(hyp_up)
+                except Exception as e1:
+                    try:
+                        ann = mne.read_annotations(hyp_up)
+                    except Exception as e2:
+                        st.error(f"Falha ao ler hipnograma {hyp_up.name}: {e2}")
+                        st.stop()
+
                 raw.set_annotations(ann, emit_warning=False)
+
                 X_, y_, fn = extract_features_from_raw(raw, epoch_len=epoch_len, resample_hz=resample_hz)
                 y_, classes_used = group_labels(y_, group=group)
-                if fnames is None: fnames = fn
-                subj_data.append({"X":X_, "y":y_})
+
+                if len(y_) == 0 or all(lab is None for lab in y_):
+                    st.error(f"{psg_up.name}: não há rótulos válidos após ler o hipnograma.")
+                    st.stop()
+
+                if fnames is None:
+                    fnames = fn
+                subj_data.append({"X": X_, "y": y_})
 
         # ---- HOLDOUT ----
         if val_mode.startswith("Holdout"):
@@ -424,7 +484,7 @@ if start_btn:
             topk = min(25, len(mean_imp))
             fig_imp, ax2 = plt.subplots(figsize=(8, 6))
             ax2.barh(range(topk), mean_imp[order[:topk]][::-1])
-            ax2.set_yticks(range(topk)); ax2.set_yticklabels([fnames[i] for i in order[:topk]][::-1], fontsize=8)
+            ax2.set_yticks(range(topk)); ax2.set_yticklabels([fnames[i] for i in order[:topk]][[::-1]], fontsize=8)
             ax2.set_xlabel("Gini importance"); ax2.set_title("Top features (média LOSO)")
             st.pyplot(fig_imp)
 
