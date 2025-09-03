@@ -27,6 +27,11 @@ if "results" not in st.session_state:
     st.session_state.results = None
 if "mode_snapshot" not in st.session_state:
     st.session_state.mode_snapshot = None
+# estado dos uploaders
+if "psg_files" not in st.session_state:
+    st.session_state.psg_files = []
+if "hyp_files" not in st.session_state:
+    st.session_state.hyp_files = []
 
 # Constantes
 CLASSES5 = ["W", "N1", "N2", "N3", "REM"]
@@ -315,7 +320,7 @@ def train_loso(subj_data, classes):
 
 
 # ==============================
-# SIDEBAR — FORM PARA EVITAR RERUN
+# SIDEBAR — FORM (config) + uploaders FORA do form
 # ==============================
 with st.sidebar.form("config"):
     st.header("⚙️ Configurações")
@@ -329,14 +334,24 @@ with st.sidebar.form("config"):
         subjects_text = st.text_input("IDs de sujeitos (ex.: 0 1)", "0")
         recording = st.number_input("Recording (geralmente 1)", 1, 2, 1, 1)
     else:
-        st.markdown("**Envie os arquivos na MESMA ordem:** 1º PSG ↔ 1º Hipnograma, 2º PSG ↔ 2º Hipnograma…")
-        psg_files = st.file_uploader("📁 PSG (EDF) — 1 ou mais", type=["edf"], accept_multiple_files=True)
-        hyp_files = st.file_uploader(
-            "📝 Hipnograma (EDF/XML) — MESMA quantidade (opcional)", type=["edf", "xml"], accept_multiple_files=True
-        )
-        st.caption("Se não enviar hipnograma, o app extrai apenas as features (sem treinar).")
+        st.markdown("**Envie os arquivos logo abaixo (fora do formulário).**\n"
+                    "Pareamento por ORDEM: 1º PSG ↔ 1º Hipnograma, 2º PSG ↔ 2º Hipnograma…")
+        subjects_text = None
+        recording = None
 
     start_btn = st.form_submit_button("🚀 Processar & Treinar")
+
+# Uploaders FORA do form (para aparecerem e funcionarem corretamente)
+if mode == "Arquivos locais (upload)":
+    st.sidebar.markdown("### 📁 Upload de arquivos")
+    st.sidebar.caption("PSG(s) em .edf e, opcionalmente, hipnogramas (.edf/.xml) na mesma quantidade.")
+    st.session_state.psg_files = st.sidebar.file_uploader(
+        "PSG (EDF) — 1 ou mais", type=["edf"], accept_multiple_files=True, key="psg_files_key"
+    )
+    st.session_state.hyp_files = st.sidebar.file_uploader(
+        "Hipnograma (EDF/XML) — MESMA quantidade (opcional)",
+        type=["edf", "xml"], accept_multiple_files=True, key="hyp_files_key"
+    )
 
 status = st.empty()
 
@@ -368,10 +383,10 @@ if start_btn:
 
         else:
             # ---- ARQUIVOS LOCAIS (UPLOAD) ----
-            # Regras:
-            # - Se enviar só PSG: extrai features e permite baixar CSV (sem rótulos)
-            # - Se enviar PSG + Hipnograma(s): deve ter a MESMA quantidade; pareamento por ORDEM
-            if not psg_files:
+            psg_files = st.session_state.psg_files
+            hyp_files = st.session_state.hyp_files
+
+            if not psg_files or len(psg_files) == 0:
                 st.error("Envie pelo menos 1 arquivo de PSG (.edf).")
                 st.stop()
 
@@ -380,7 +395,7 @@ if start_btn:
                 st.warning("Nenhum hipnograma enviado. Vou extrair features SEM rótulos (não dá para treinar/avaliar).")
                 all_feats = []
                 fnames = None
-                for psg_up in psg_files:
+                for psg_up in sorted(psg_files, key=lambda f: f.name):
                     raw = read_raw_edf(psg_up, preload=True, verbose=False)
                     X_, y_, fn = extract_features_from_raw(raw, epoch_len=epoch_len, resample_hz=resample_hz)
                     if fnames is None:
@@ -398,7 +413,7 @@ if start_btn:
                     )
                 st.stop()
 
-            # Pares PSG + Hipnograma
+            # Pares PSG + Hipnograma (quantidade igual)
             if len(psg_files) != len(hyp_files):
                 st.error("O número de PSGs e hipnogramas deve ser o mesmo.")
                 st.stop()
@@ -415,11 +430,8 @@ if start_btn:
                 try:
                     ann = mne.read_annotations(hyp_up)
                 except Exception as e1:
-                    try:
-                        ann = mne.read_annotations(hyp_up)  # segunda tentativa
-                    except Exception as e2:
-                        st.error(f"Falha ao ler hipnograma {hyp_up.name}: {e2}")
-                        st.stop()
+                    st.error(f"Falha ao ler hipnograma {hyp_up.name}: {e1}")
+                    st.stop()
 
                 raw.set_annotations(ann, emit_warning=False)
                 X_, y_, fn = extract_features_from_raw(raw, epoch_len=epoch_len, resample_hz=resample_hz)
@@ -537,7 +549,7 @@ if start_btn:
             fig_imp, ax2 = plt.subplots(figsize=(8, 6))
             ax2.barh(range(topk), mean_imp[order[:topk]][::-1])
             ax2.set_yticks(range(topk))
-            # ✅ correção do bug aqui:
+            # ✅ correção do bug:
             ax2.set_yticklabels([fnames[i] for i in order[:topk]][::-1], fontsize=8)
             ax2.set_xlabel("Gini importance")
             ax2.set_title("Top features (média LOSO)")
@@ -620,4 +632,3 @@ else:
     if st.button("🧹 Limpar resultados"):
         st.session_state.results = None
         st.rerun()
-
