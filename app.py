@@ -1,4 +1,4 @@
-import os, io
+import os, io, joblib, tempfile, hashlib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -15,11 +15,13 @@ from scipy.signal import welch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage
 from reportlab.lib.styles import getSampleStyleSheet
 
+# ---------- CONFIG BÁSICA ----------
 st.set_page_config(page_title="Sono XAI", layout="wide")
-st.title("💤 IA Interpretável para Estadiamento do Sono — Upload / Sleep-EDF / PDF / Agrupamento N1+N2")
+st.title("💤 IA Interpretável para Estadiamento do Sono — Sleep-EDF / Upload / PDF / LOSO")
 
 CLASSES5 = ["W","N1","N2","N3","REM"]
 CLASSES4 = ["W","SonoLeve","N3","REM"]
+BANDS = {"delta":(0.5,4),"theta":(4,8),"alpha":(8,12),"sigma":(12,16),"beta":(16,30)}
 
 STAGE_MAP = {
     "Sleep stage W": "W",
@@ -31,10 +33,9 @@ STAGE_MAP = {
     "Sleep stage ?": None,
     "Movement time": None,
 }
-BANDS = {"delta":(0.5,4),"theta":(4,8),"alpha":(8,12),"sigma":(12,16),"beta":(16,30)}
 
+# ---------- FUNÇÕES DE SINAL ----------
 def bandpower(x, sf, fmin, fmax):
-    from scipy.signal import welch
     freqs, psd = welch(x, sf, nperseg=int(sf*4), noverlap=int(sf*2))
     idx = (freqs>=fmin)&(freqs<fmax)
     return float(np.trapz(psd[idx], freqs[idx])) if np.any(idx) else 0.0
@@ -60,7 +61,7 @@ def epoch_labels_from_annotations(raw, epoch_len=30.0):
     return np.array(labels, dtype=object)
 
 def detect_spindles_K_simple(raw, epoch_len=30.0):
-    """Detecção simples (heurística) p/ IC: densidade de fusos e K-Complex por época."""
+    """Detecção heurística para IC: densidade de fusos (12–16 Hz) e K (0.7–2 Hz) por época."""
     sf = raw.info["sfreq"]
     eeg_chs, _, _ = pick_channels(raw.ch_names)
     if not eeg_chs:
@@ -68,18 +69,15 @@ def detect_spindles_K_simple(raw, epoch_len=30.0):
     ch = eeg_chs[0]
     x = raw.get_data(picks=[ch])[0]
 
-    # Filtrar faixas típicas
     from scipy.signal import butter, filtfilt
     def bp(sig, lo, hi): 
         b,a = butter(4, [lo/(sf/2), hi/(sf/2)], btype="band")
         return filtfilt(b,a,sig)
 
-    # Fusos ~12–16 Hz
     x_sigma = bp(x, 12, 16)
     thr_sigma = np.percentile(np.abs(x_sigma), 95)
     spindle_mask = np.abs(x_sigma) > thr_sigma
 
-    # K-complex ~ onda lenta negativa + rebote: aqui usamos banda 0.7–2 Hz como proxy
     x_k = bp(x, 0.7, 2.0)
     thr_k = np.percentile(np.abs(x_k), 95)
     k_mask = np.abs(x_k) > thr_k
@@ -127,11 +125,8 @@ def extract_features_from_raw(raw, epoch_len=30.0, resample_hz=100):
             idx = raw.ch_names.index(eog_chs[0]); row.append(float(np.var(seg[idx])))
         if emg_chs:
             idx = raw.ch_names.index(emg_chs[0]); x = seg[idx]; row.append(float(np.sqrt(np.mean(x**2))))
-        # eventos
-        if sp_dens is not None: row.append(float(sp_dens[i]))
-        else: row.append(0.0)
-        if k_dens is not None: row.append(float(k_dens[i]))
-        else: row.append(0.0)
+        row.append(float(sp_dens[i]) if sp_dens is not None else 0.0)
+        row.append(float(k_dens[i]) if k_dens is not None else 0.0)
         X_rows.append(row)
 
     X = np.array(X_rows, dtype=float)
@@ -139,28 +134,73 @@ def extract_features_from_raw(raw, epoch_len=30.0, resample_hz=100):
     mask = y != None
     return X[mask], y[mask], feat_names
 
-def train_and_eval(X,y,group=False):
-    if group:
-        y = np.where(np.isin(y,["N1","N2"]), "SonoLeve", y)
-        classes = CLASSES4
-    else:
-        classes = CLASSES5
+# ---------- IA ----------
+def group_labels(y, group=False):
+    if not group:
+        return y, CLASSES5
+    y2 = np.where(np.isin(y,["N1","N2"]), "SonoLeve", y)
+    return y2, CLASSES4
 
-    Xtr,Xte,ytr,yte = train_test_split(X,y,test_size=0.25,random_state=42,stratify=y)
-    scaler = StandardScaler(); Xtr_s = scaler.fit_transform(Xtr); Xte_s = scaler.transform(Xte)
-    rf = RandomForestClassifier(n_estimators=300, random_state=42)
-    rf.fit(Xtr_s, ytr); pred = rf.predict(Xte_s)
-    rep = classification_report(yte, pred, labels=classes, zero_division=0, output_dict=True)
-    cm  = confusion_matrix(yte, pred, labels=classes)
-    importances = rf.feature_importances_
-    return rf, rep, cm, importances, classes
+def compute_sleep_stats(y_seq, epoch_len=30.0, classes=None):
+    """Estatísticas simples de arquitetura de sono para o relatório."""
+    if classes is None: classes = sorted(pd.unique(y_seq))
+    total_epochs = len(y_seq)
+    tib_sec = total_epochs * epoch_len
+    # TST = tudo que não é W
+    sleep_mask = y_seq != "W"
+    tst_sec = int(np.sum(sleep_mask) * epoch_len)
+    eff = tst_sec / tib_sec if tib_sec > 0 else 0.0
+    # latência até primeiro sono (primeiro != W)
+    try:
+        lat_idx = np.where(y_seq != "W")[0][0]
+        latency_sec = int(lat_idx * epoch_len)
+    except Exception:
+        latency_sec = None
 
-def export_pdf(rep_dict, cm, classes, imp_fig_path, outpath="report.pdf"):
+    perc = {}
+    for c in classes:
+        perc[c] = float(np.mean(y_seq==c))*100.0
+
+    return {
+        "epochs_total": int(total_epochs),
+        "tib_min": tib_sec/60.0,
+        "tst_min": tst_sec/60.0,
+        "efficiency": eff*100.0,
+        "latency_min": (latency_sec/60.0) if latency_sec is not None else None,
+        "percent_by_stage": perc
+    }
+
+def plot_hypnogram(y_true, y_pred, classes, fname="hypnogram.png", title="Hipnograma (Real x Previsto)"):
+    # mapa para níveis
+    mapping = {c:i for i,c in enumerate(classes)}
+    t = np.arange(len(y_true))
+    plt.figure(figsize=(10,3))
+    plt.plot(t, [mapping[c] for c in y_true], drawstyle="steps-mid", label="Real")
+    plt.plot(t, [mapping[c] for c in y_pred], drawstyle="steps-mid", alpha=0.6, label="Previsto")
+    plt.yticks(range(len(classes)), classes)
+    plt.xlabel("Épocas (30s cada)"); plt.title(title); plt.legend(loc="upper right")
+    plt.tight_layout(); plt.savefig(fname, dpi=150); plt.close()
+    return fname
+
+def export_pdf(rep_dict, cm, classes, imp_fig_path, hyp_fig_path, stats_dict, outpath="report.pdf"):
     doc = SimpleDocTemplate(outpath)
     styles = getSampleStyleSheet()
     elems = [Paragraph("Relatório Sono XAI", styles["Title"]), Spacer(1,12)]
 
-    # Tabela de métricas em texto simples
+    # Estatísticas clínicas
+    s = stats_dict
+    lines_stats = [
+        f"Épocas totais: {s['epochs_total']}",
+        f"Tempo na cama (TIB): {s['tib_min']:.1f} min",
+        f"Tempo total de sono (TST): {s['tst_min']:.1f} min",
+        f"Eficiência do sono: {s['efficiency']:.1f}%",
+        f"Latência do sono: {s['latency_min']:.1f} min" if s['latency_min'] is not None else "Latência do sono: n/d",
+        "Distribuição por estágio: " + ", ".join([f"{k}={v:.1f}%" for k,v in s["percent_by_stage"].items()])
+    ]
+    elems.append(Paragraph("<br/>".join(lines_stats), styles["Normal"]))
+    elems.append(Spacer(1,12))
+
+    # Tabela de métricas em texto
     lines = []
     for k,v in rep_dict.items():
         if isinstance(v, dict):
@@ -178,19 +218,76 @@ def export_pdf(rep_dict, cm, classes, imp_fig_path, outpath="report.pdf"):
     elems.append(RLImage("cm.png", width=380, height=300))
     elems.append(Spacer(1,12))
 
-    # Importâncias (imagem já gerada fora)
-    elems.append(RLImage(imp_fig_path, width=400, height=300))
+    # Hipnograma
+    elems.append(RLImage(hyp_fig_path, width=500, height=160))
+    elems.append(Spacer(1,12))
+
+    # Importâncias
+    elems.append(RLImage(imp_fig_path, width=500, height=360))
 
     doc.build(elems)
     with open(outpath, "rb") as f:
         return f.read()
 
+def train_holdout(X, y, classes):
+    Xtr,Xte,ytr,yte = train_test_split(X,y,test_size=0.25,random_state=42,stratify=y)
+    scaler = StandardScaler(); Xtr_s = scaler.fit_transform(Xtr); Xte_s = scaler.transform(Xte)
+    rf = RandomForestClassifier(n_estimators=300, random_state=42)
+    rf.fit(Xtr_s, ytr); pred = rf.predict(Xte_s)
+    rep = classification_report(yte, pred, labels=classes, zero_division=0, output_dict=True)
+    cm  = confusion_matrix(yte, pred, labels=classes)
+    importances = rf.feature_importances_
+    return rf, scaler, rep, cm, importances, (yte, pred)
+
+def train_loso(subj_data, classes):
+    """subj_data = list of dicts: {'X':..., 'y':..., 'feat_names':...}"""
+    all_reports = []
+    cms = []
+    importances_all = []
+    folds_info = []
+
+    for i in range(len(subj_data)):
+        X_te = subj_data[i]['X']; y_te = subj_data[i]['y']
+        X_tr = np.vstack([d['X'] for j,d in enumerate(subj_data) if j!=i])
+        y_tr = np.concatenate([d['y'] for j,d in enumerate(subj_data) if j!=i])
+
+        scaler = StandardScaler(); Xtr_s = scaler.fit_transform(X_tr); Xte_s = scaler.transform(X_te)
+        rf = RandomForestClassifier(n_estimators=300, random_state=42)
+        rf.fit(Xtr_s, y_tr); pred = rf.predict(Xte_s)
+
+        rep = classification_report(y_te, pred, labels=classes, zero_division=0, output_dict=True)
+        cm  = confusion_matrix(y_te, pred, labels=classes)
+
+        all_reports.append(rep); cms.append(cm)
+        importances_all.append(rf.feature_importances_)
+        folds_info.append({"y_true": y_te, "y_pred": pred})
+
+    # médias
+    mean_cm = np.mean(np.stack(cms), axis=0).round(1)
+    mean_imp = np.mean(np.stack(importances_all), axis=0)
+    # média de classification_report
+    keys = list(all_reports[0].keys())
+    mean_report = {}
+    for k in keys:
+        if isinstance(all_reports[0][k], dict):
+            mean_report[k] = {}
+            for m in all_reports[0][k].keys():
+                mean_report[k][m] = float(np.mean([r[k][m] for r in all_reports]))
+        else:
+            mean_report[k] = float(np.mean([r[k] for r in all_reports]))
+
+    # usa o último fold para hipnograma ilustrativo
+    last_fold = folds_info[-1]
+    return mean_report, mean_cm, mean_imp, last_fold
+
+# ---------- SIDEBAR ----------
 with st.sidebar:
     st.header("⚙️ Configurações")
     mode = st.radio("Modo de dados:", ["Sleep-EDF (baixar)", "Arquivos locais (upload)"])
-    group = st.checkbox("Agrupar N1+N2 como Sono Leve")
+    group = st.checkbox("Agrupar N1+N2 como Sono Leve", value=True)
     epoch_len = st.number_input("Duração da época (s)", 10.0, 60.0, 30.0, 5.0)
     resample_hz = st.number_input("Reamostragem (Hz)", 50.0, 200.0, 100.0, 10.0)
+    val_mode = st.radio("Modo de validação:", ["Holdout (75/25)", "LOSO (por sujeito)"])
 
     if mode == "Sleep-EDF (baixar)":
         subjects_text = st.text_input("IDs de sujeitos (ex.: 0 1)", "0")
@@ -203,9 +300,11 @@ with st.sidebar:
 
 status = st.empty()
 
+# ---------- EXECUÇÃO ----------
 if start_btn:
     try:
-        all_X, all_y, fnames = [], [], None
+        subj_data = []  # lista por sujeito: dict com X,y,feat_names
+        fnames = None
 
         if mode == "Sleep-EDF (baixar)":
             try:
@@ -220,9 +319,9 @@ if start_btn:
                 ann = mne.read_annotations(hyp_path)
                 raw.set_annotations(ann, emit_warning=False)
                 X_, y_, fn = extract_features_from_raw(raw, epoch_len=epoch_len, resample_hz=resample_hz)
+                y_, classes_used = group_labels(y_, group=group)
                 if fnames is None: fnames = fn
-                all_X.append(X_); all_y.append(y_)
-
+                subj_data.append({"X":X_, "y":y_})
         else:
             if not psg_files or not hyp_files:
                 st.error("Envie PSG(s) e hipnograma(s) com a mesma quantidade."); st.stop()
@@ -233,50 +332,112 @@ if start_btn:
                 ann = mne.read_annotations(hyp_up)
                 raw.set_annotations(ann, emit_warning=False)
                 X_, y_, fn = extract_features_from_raw(raw, epoch_len=epoch_len, resample_hz=resample_hz)
+                y_, classes_used = group_labels(y_, group=group)
                 if fnames is None: fnames = fn
-                all_X.append(X_); all_y.append(y_)
+                subj_data.append({"X":X_, "y":y_})
 
-        X = np.vstack(all_X); y = np.concatenate(all_y)
-        status.success(f"Dados prontos: {X.shape[0]} épocas, {X.shape[1]} features. Treinando…")
+        # Se for holdout, junta tudo; se LOSO, usa fold por sujeito
+        if val_mode.startswith("Holdout"):
+            X = np.vstack([d['X'] for d in subj_data]); y = np.concatenate([d['y'] for d in subj_data])
+            status.success(f"Dados prontos: {X.shape[0]} épocas, {X.shape[1]} features. Treinando (Holdout)…")
+            rf, scaler, rep, cm, importances, (yte, pred) = train_holdout(X, y, classes_used)
 
-        rf, rep, cm, importances, classes = train_and_eval(X, y, group=group)
+            # Tabelas e gráficos na UI
+            st.subheader("📈 Relatório de Classificação (Holdout)")
+            st.dataframe(pd.DataFrame(rep).T.round(3))
 
-        st.subheader("📈 Relatório de Classificação")
-        df_rep = pd.DataFrame(rep).T.round(3)
-        st.dataframe(df_rep)
+            st.subheader("🧩 Matriz de Confusão")
+            fig_cm, ax = plt.subplots()
+            ax.imshow(cm); ax.set_xticks(range(len(classes_used))); ax.set_xticklabels(classes_used)
+            ax.set_yticks(range(len(classes_used))); ax.set_yticklabels(classes_used)
+            ax.set_title("Confusion Matrix")
+            for i in range(len(classes_used)):
+                for j in range(len(classes_used)):
+                    ax.text(j, i, cm[i, j], ha="center", va="center", color="red", fontsize=8)
+            st.pyplot(fig_cm)
 
-        st.subheader("🧩 Matriz de Confusão")
-        fig_cm, ax = plt.subplots()
-        ax.imshow(cm); ax.set_xticks(range(len(classes))); ax.set_xticklabels(classes)
-        ax.set_yticks(range(len(classes))); ax.set_yticklabels(classes)
-        ax.set_title("Confusion Matrix")
-        for i in range(len(classes)):
-            for j in range(len(classes)):
-                ax.text(j, i, cm[i, j], ha="center", va="center", color="red", fontsize=8)
-        st.pyplot(fig_cm)
+            st.subheader("🔍 Importância das Features")
+            order = np.argsort(importances)[::-1]
+            topk = min(25, len(importances))
+            fig_imp, ax2 = plt.subplots(figsize=(8, 6))
+            ax2.barh(range(topk), importances[order[:topk]][::-1])
+            ax2.set_yticks(range(topk)); ax2.set_yticklabels([fnames[i] for i in order[:topk]][::-1], fontsize=8)
+            ax2.set_xlabel("Gini importance"); ax2.set_title("Top features")
+            st.pyplot(fig_imp)
 
-        st.subheader("🔍 Importância das Features")
-        order = np.argsort(importances)[::-1]
-        topk = min(25, len(importances))
-        fig_imp, ax2 = plt.subplots(figsize=(8, 6))
-        ax2.barh(range(topk), importances[order[:topk]][::-1])
-        ax2.set_yticks(range(topk)); ax2.set_yticklabels([fnames[i] for i in order[:topk]][::-1], fontsize=8)
-        ax2.set_xlabel("Gini importance"); ax2.set_title("Top features")
-        st.pyplot(fig_imp)
+            # Hipnograma + stats (usando a sequência do conjunto de teste)
+            hyp_path = plot_hypnogram(yte, pred, classes_used, fname="hyp_holdout.png", title="Hipnograma (Holdout — teste)")
+            stats = compute_sleep_stats(yte, epoch_len=epoch_len, classes=classes_used)
 
-        # Salvar figura de importâncias para o PDF
-        imp_fig_path = "feature_importance.png"
-        fig_imp.savefig(imp_fig_path, dpi=150)
+            # PDF
+            fig_imp.savefig("feature_importance.png", dpi=150)
+            pdf_bytes = export_pdf(rep, cm, classes_used, "feature_importance.png", hyp_path, stats, outpath="report.pdf")
+            st.download_button("⬇️ Baixar Relatório PDF", data=pdf_bytes, file_name="report.pdf", mime="application/pdf")
 
-        pdf_bytes = export_pdf(rep, cm, classes, imp_fig_path, outpath="report.pdf")
-        st.download_button("⬇️ Baixar Relatório PDF", data=pdf_bytes, file_name="report.pdf", mime="application/pdf")
+            # Features CSV (todas, não apenas teste)
+            df_feats = pd.DataFrame(X, columns=fnames); df_feats["stage"] = y
+            st.download_button("Baixar features.csv", data=df_feats.to_csv(index=False).encode("utf-8"),
+                               file_name="features.csv", mime="text/csv")
 
-        # Também oferecer features e CSV
-        df_feats = pd.DataFrame(X, columns=fnames); df_feats["stage"] = y
-        st.download_button("Baixar features.csv", data=df_feats.to_csv(index=False).encode("utf-8"),
-                           file_name="features.csv", mime="text/csv")
+            # Salvar modelo (para reuso)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".joblib") as tmpf:
+                joblib.dump({"model":rf, "scaler":scaler, "classes":classes_used, "features":fnames}, tmpf.name)
+                with open(tmpf.name, "rb") as f:
+                    st.download_button("💾 Baixar modelo treinado (.joblib)", data=f.read(),
+                                       file_name="sono_xai_model.joblib", mime="application/octet-stream")
 
-        st.success("Concluído! ✅")
+            st.success("Concluído! ✅")
+
+        else:
+            # LOSO
+            if len(subj_data) < 2:
+                st.error("LOSO requer pelo menos 2 sujeitos."); st.stop()
+
+            status.success(f"{len(subj_data)} sujeitos carregados. Executando LOSO…")
+            mean_report, mean_cm, mean_imp, last_fold = train_loso(subj_data, classes_used)
+
+            st.subheader("📈 Relatório de Classificação (média LOSO)")
+            st.dataframe(pd.DataFrame(mean_report).T.round(3))
+
+            st.subheader("🧩 Matriz de Confusão (média LOSO)")
+            fig_cm, ax = plt.subplots()
+            ax.imshow(mean_cm); ax.set_xticks(range(len(classes_used))); ax.set_xticklabels(classes_used)
+            ax.set_yticks(range(len(classes_used))); ax.set_yticklabels(classes_used)
+            ax.set_title("Confusion Matrix — média (validação por sujeito)")
+            for i in range(len(classes_used)):
+                for j in range(len(classes_used)):
+                    ax.text(j, i, int(mean_cm[i, j]), ha="center", va="center", color="red", fontsize=8)
+            st.pyplot(fig_cm)
+
+            st.subheader("🔍 Importância das Features (média LOSO)")
+            order = np.argsort(mean_imp)[::-1]
+            topk = min(25, len(mean_imp))
+            fig_imp, ax2 = plt.subplots(figsize=(8, 6))
+            ax2.barh(range(topk), mean_imp[order[:topk]][::-1])
+            ax2.set_yticks(range(topk)); ax2.set_yticklabels([fnames[i] for i in order[:topk]][::-1], fontsize=8)
+            ax2.set_xlabel("Gini importance"); ax2.set_title("Top features (média LOSO)")
+            st.pyplot(fig_imp)
+
+            # Hipnograma para o último fold (sujeito de teste)
+            hyp_path = plot_hypnogram(last_fold["y_true"], last_fold["y_pred"], classes_used,
+                                      fname="hyp_loso.png", title="Hipnograma (sujeito de teste — LOSO)")
+            stats = compute_sleep_stats(last_fold["y_true"], epoch_len=epoch_len, classes=classes_used)
+
+            # PDF (médias LOSO + hipnograma do sujeito de teste)
+            fig_imp.savefig("feature_importance.png", dpi=150)
+            pdf_bytes = export_pdf(mean_report, mean_cm, classes_used, "feature_importance.png", hyp_path, stats, outpath="report.pdf")
+            st.download_button("⬇️ Baixar Relatório PDF (LOSO)", data=pdf_bytes, file_name="report_loso.pdf", mime="application/pdf")
+
+            # Exportar features concatenadas (útil p/ análises futuras)
+            X_all = np.vstack([d['X'] for d in subj_data]); y_all = np.concatenate([d['y'] for d in subj_data])
+            df_feats = pd.DataFrame(X_all, columns=fnames); df_feats["stage"] = y_all
+            st.download_button("Baixar features.csv (todos os sujeitos)", data=df_feats.to_csv(index=False).encode("utf-8"),
+                               file_name="features_all.csv", mime="text/csv")
+
+            st.info("LOSO finalizado. Para reuso de modelo LOSO (treino em N-1), rode salvando manualmente a cada fold caso necessário.")
+            st.success("Concluído! ✅")
 
     except Exception as e:
         st.error(f"Erro: {e}")
+
+
