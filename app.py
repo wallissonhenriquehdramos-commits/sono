@@ -1,4 +1,4 @@
-# app.py — Sono-XAI com Holdout/LOSO, upload local robusto, hipnograma, PDF clínico e sessão persistente
+# app.py — Sono-XAI com Holdout/LOSO, upload local robusto, hipnograma (EDF/XML), PDF clínico e sessão persistente
 import os, io, joblib, tempfile
 import numpy as np
 import pandas as pd
@@ -57,16 +57,122 @@ def _materialize_upload(uploaded_file, suffix=None):
     """
     if uploaded_file is None:
         return None
-    # Se já for um path/bytes/PathLike, apenas converte para str
     if isinstance(uploaded_file, (str, bytes, os.PathLike)):
         return str(uploaded_file)
-    # Extensão (mantém a original se possível)
     ext = suffix or os.path.splitext(getattr(uploaded_file, "name", ""))[1] or ""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
     tmp.write(uploaded_file.getbuffer())
     tmp.flush()
     tmp.close()
     return tmp.name
+
+# ---- Leitor genérico de hipnogramas (.edf ou .xml) ----
+def read_hyp_annotations_any(hyp_path: str):
+    """
+    Retorna mne.Annotations a partir de um arquivo de hipnograma EDF ou XML.
+    - EDF: usa mne.read_annotations
+    - XML: tenta formatos comuns (ScoredEvents / Stages|Stage X, com Start/Duration)
+    """
+    ext = os.path.splitext(hyp_path)[1].lower()
+    if ext == ".edf":
+        return mne.read_annotations(hyp_path)
+
+    if ext != ".xml":
+        raise ValueError(f"Formato de hipnograma não suportado: {ext}")
+
+    # Tenta parsear XML em formatos comuns
+    try:
+        try:
+            from lxml import etree as ET  # mais robusto
+        except Exception:
+            import xml.etree.ElementTree as ET  # fallback
+
+        tree = ET.parse(hyp_path)
+        root = tree.getroot()
+
+        onsets, durs, descs = [], [], []
+
+        def _stage_from_text(txt: str):
+            if not txt:
+                return None
+            t = txt.lower()
+            if "stage w" in t or "wake" in t:
+                return "Sleep stage W"
+            if "stage r" in t or "rem" in t:
+                return "Sleep stage R"
+            if "stage 1" in t:
+                return "Sleep stage 1"
+            if "stage 2" in t:
+                return "Sleep stage 2"
+            if "stage 3" in t:
+                return "Sleep stage 3"
+            if "stage 4" in t:
+                return "Sleep stage 4"
+            return None
+
+        # Padrão comum: <ScoredEvents><ScoredEvent>...</ScoredEvent></ScoredEvents>
+        for se in root.findall(".//ScoredEvent"):
+            etype = getattr(se.find("EventType"), "text", None)
+            econcept = getattr(se.find("EventConcept"), "text", None)
+            start_txt = getattr(se.find("Start"), "text", None) or getattr(se.find("StartTime"), "text", None)
+            dur_txt = getattr(se.find("Duration"), "text", None)
+
+            try:
+                start = float(start_txt) if start_txt is not None else None
+            except Exception:
+                start = None
+            try:
+                dur = float(dur_txt) if dur_txt is not None else None
+            except Exception:
+                dur = None
+
+            label = _stage_from_text(etype) or _stage_from_text(econcept)
+            if label and start is not None and dur and dur > 0:
+                onsets.append(start)
+                durs.append(dur)
+                descs.append(label)
+
+        # Alternativo: <SleepStages><Stage>...</Stage>...</SleepStages>
+        if not onsets:
+            for stg in root.findall(".//SleepStages//Stage"):
+                val_txt = getattr(stg.find("Stage"), "text", None) or getattr(stg.find("Value"), "text", None)
+                start_txt = getattr(stg.find("Start"), "text", None)
+                dur_txt = getattr(stg.find("Duration"), "text", None)
+
+                try:
+                    start = float(start_txt) if start_txt is not None else None
+                except Exception:
+                    start = None
+                try:
+                    dur = float(dur_txt) if dur_txt is not None else None
+                except Exception:
+                    dur = None
+
+                label = None
+                if val_txt is not None:
+                    v = val_txt.strip()
+                    mapping = {
+                        "0": "Sleep stage W", "W": "Sleep stage W",
+                        "1": "Sleep stage 1",
+                        "2": "Sleep stage 2",
+                        "3": "Sleep stage 3",
+                        "4": "Sleep stage 4",
+                        "R": "Sleep stage R", "5": "Sleep stage R",
+                    }
+                    label = mapping.get(v, None)
+
+                if label and start is not None and dur and dur > 0:
+                    onsets.append(start)
+                    durs.append(dur)
+                    descs.append(label)
+
+        if not onsets:
+            raise ValueError("Não foi possível identificar eventos de estágios no XML.")
+
+        return mne.Annotations(onset=onsets, duration=durs, description=descs, orig_time=None)
+
+    except Exception as e:
+        raise ValueError(f"XML de hipnograma não reconhecido: {e}")
 
 # ==============================
 # FUNÇÕES DE SINAL
@@ -359,7 +465,7 @@ if start_btn:
             paths = fetch_data(subjects=subs, recording=[int(recording)])
             for psg_path, hyp_path in paths:
                 raw = read_raw_edf(psg_path, preload=True, verbose=False)
-                ann = mne.read_annotations(hyp_path)
+                ann = read_hyp_annotations_any(hyp_path)  # ✅ usa helper (edf/xml)
                 raw.set_annotations(ann, emit_warning=False)
                 X_, y_, fn = extract_features_from_raw(raw, epoch_len=epoch_len, resample_hz=resample_hz)
                 y_, classes_used = group_labels(y_, group=group)
@@ -409,7 +515,7 @@ if start_btn:
                 hyp_path = _materialize_upload(hyp_up)  # mantém extensão (.edf ou .xml)
 
                 raw = read_raw_edf(psg_path, preload=True, verbose=False)
-                ann = mne.read_annotations(hyp_path)
+                ann = read_hyp_annotations_any(hyp_path)  # ✅ usa helper (edf/xml)
                 raw.set_annotations(ann, emit_warning=False)
 
                 X_, y_, fn = extract_features_from_raw(raw, epoch_len=epoch_len, resample_hz=resample_hz)
